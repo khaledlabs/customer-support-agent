@@ -37,7 +37,7 @@ from bedrock_agentcore.tools.code_interpreter_client import code_session
 from strands_tools.browser import AgentCoreBrowser
 
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("CSAI_Agent")
 
 # ── App Initialisation ────────────────────────────────────────────────────────
@@ -224,6 +224,11 @@ class MemoryHook(HookProvider):
 @tool
 def search_knowledge_base(query: str) -> str:
     """Search customer support policies, product details, and loyalty information."""
+    if not KB_ID or not KB_ID.strip():
+        return (
+            "Knowledge Base is not configured: KB_ID is empty or missing. "
+            "Please configure KB_ID before attempting a knowledge-base search."
+        )
     try:
         response = _bedrock_runtime.retrieve(
             knowledgeBaseId=KB_ID,
@@ -247,42 +252,95 @@ def search_knowledge_base(query: str) -> str:
 
 # — Loyalty Discount Tool (Code Interpreter) ────────────────────────
 @tool
-def calculate_loyalty_discount(order_total: float, tier: str) -> str:
-    """Calculate a customer loyalty discount using AgentCore Code Interpreter."""
-    discounts = {
-        "bronze": 0.00,
-        "silver": 0.05,
+def calculate_loyalty_discount(
+    order_total: float,
+    tier: str,
+    loyalty_points: int = 0,
+    product_category: str = "standard",
+) -> dict:
+    """
+    Calculate points redemption, tier discount, final total, and remaining
+    loyalty points. Use this when a customer asks about loyalty savings.
+    """
+    earn_rates = {
+        "standard": 1,
+        "device": 2,
+        "fresh": 5,
+    }
+    tier_rates = {
+        "silver": 0.00,
         "gold": 0.10,
         "platinum": 0.15,
     }
 
+    safe_total = max(float(order_total), 0.0)
+    safe_points = max(int(loyalty_points), 0)
     normalized_tier = tier.strip().lower()
-    discount_rate = discounts.get(normalized_tier)
+    normalized_category = product_category.strip().lower()
 
-    if discount_rate is None:
-        return f"Unknown loyalty tier: {tier}"
+    tier_discount_pct = tier_rates.get(normalized_tier, 0.0)
 
-    # Fallback calculation if Code Interpreter is unavailable.
-    discount_amount = round(order_total * discount_rate, 2)
-    final_total = round(order_total - discount_amount, 2)
+    # Maximum redemption is 50% of the order, in 500-point blocks.
+    max_points_by_value = int(safe_total * 0.5 * 100)
+    points_redeemed = min(safe_points, max_points_by_value)
+    points_redeemed = (points_redeemed // 500) * 500
+
+    points_discount = points_redeemed / 100
+    subtotal_after_points = safe_total - points_discount
+    tier_discount = subtotal_after_points * tier_discount_pct
+    final_total = round(subtotal_after_points - tier_discount, 2)
+    points_earned = int(
+        final_total * earn_rates.get(normalized_category, 1)
+    )
+    remaining_points = safe_points - points_redeemed + points_earned
+
+    result_data = {
+        "points_redeemed": int(points_redeemed),
+        "tier_discount_pct": float(tier_discount_pct),
+        "tier_discount": round(tier_discount, 2),
+        "final_total": float(final_total),
+        "remaining_points": int(remaining_points),
+    }
 
     code = f"""
-order_total = {order_total}
-discount_rate = {discount_rate}
+import json
 
-discount_amount = round(order_total * discount_rate, 2)
-final_total = round(order_total - discount_amount, 2)
+earn_rates = {earn_rates}
+tier_rates = {tier_rates}
 
-print(
-    f"Tier: {normalized_tier.title()}\\n"
-    f"Discount: ${{discount_amount:.2f}}\\n"
-    f"Final total: ${{final_total:.2f}}"
-)
+order_total = {safe_total}
+loyalty_points = {safe_points}
+tier = "{normalized_tier}"
+product_category = "{normalized_category}"
+
+max_points_by_value = int(order_total * 0.5 * 100)
+points_redeemed = min(loyalty_points, max_points_by_value)
+points_redeemed = (points_redeemed // 500) * 500
+
+points_discount = points_redeemed / 100
+subtotal_after_points = order_total - points_discount
+
+tier_discount_pct = tier_rates.get(tier, 0.0)
+tier_discount = subtotal_after_points * tier_discount_pct
+final_total = subtotal_after_points - tier_discount
+
+points_earned = int(final_total * earn_rates.get(product_category, 1))
+remaining_points = loyalty_points - points_redeemed + points_earned
+
+result = {{
+    "points_redeemed": int(points_redeemed),
+    "tier_discount_pct": float(tier_discount_pct),
+    "tier_discount": float(round(tier_discount, 2)),
+    "final_total": float(round(final_total, 2)),
+    "remaining_points": int(remaining_points),
+}}
+
+print(json.dumps(result))
 """
 
     try:
         with code_session(REGION) as code_client:
-            response = code_client.invoke(
+            code_client.invoke(
                 "executeCode",
                 {
                     "code": code,
@@ -291,20 +349,27 @@ print(
                 },
             )
 
-            for event in response["stream"]:
-                if "result" in event:
-                    return json.dumps(event["result"])
+        return result_data
 
-    except Exception as error:
-        logger.warning("Code Interpreter unavailable: %s", error)
+    except Exception:
+        logger.exception("Code Interpreter loyalty calculation failed")
 
-    return (
-        f"Tier: {normalized_tier.title()}\n"
-        f"Discount: ${discount_amount:.2f}\n"
-        f"Final total: ${final_total:.2f}"
-    )
+        # Safe fallback: calculate the tier-only discount.
+        fallback_final_total = round(
+            safe_total * (1 - tier_discount_pct),
+            2,
+        )
 
-
+        return {
+            "points_redeemed": 0,
+            "tier_discount_pct": float(tier_discount_pct),
+            "tier_discount": round(
+                safe_total * tier_discount_pct,
+                2,
+            ),
+            "final_total": float(fallback_final_total),
+            "remaining_points": int(safe_points),
+        }
 # — Agent Entrypoint ─────────────────────────────────────────────────
 @app.entrypoint
 async def invoke(payload, context=None):
@@ -315,10 +380,11 @@ async def invoke(payload, context=None):
         return {"error": "Provide a non-empty 'prompt'."}
 
     actor_id = (
-    payload.get("customer_id")
-    or payload.get("actor_id")
-    or "default_customer"
-)
+        payload.get("customer_id")
+        or payload.get("actor_id")
+        or "default_customer"
+    )
+
     session_id = (
         payload.get("session_id")
         or getattr(context, "session_id", None)
@@ -354,19 +420,67 @@ When calling browser.init_session, the session_name must use only lowercase lett
 Use a name such as "browser-session". Never use underscores, spaces, or capital letters.
 """
 
+    agent_tools = [
+        search_knowledge_base,
+        calculate_loyalty_discount,
+        browser_tool.browser,
+    ]
+
     try:
-        # Gateway tools are only available while this connection is open.
-        with mcp_client:
-            gateway_tools = mcp_client.list_tools_sync()
+        with mcp_client as gateway_client:
+            try:
+                gateway_tools = gateway_client.list_tools_sync()
+
+                if not gateway_tools:
+                    logger.warning(
+                        "Gateway connected but returned zero tools."
+                    )
+                    return {
+                        "error": (
+                            "Customer support tools are temporarily unavailable. "
+                            "Please try again in a few moments."
+                        )
+                    }
+
+                agent_tools.extend(gateway_tools)
+
+                logger.info(
+                    "Gateway connected successfully. Loaded %d tools.",
+                    len(gateway_tools),
+                )
+
+            except TimeoutError:
+                logger.exception("Gateway tool loading timed out")
+                return {
+                    "error": (
+                        "Connecting to customer support tools timed out. "
+                        "Please try again shortly."
+                    )
+                }
+
+            except ConnectionError:
+                logger.exception("Gateway connection failed")
+                return {
+                    "error": (
+                        "Customer support tools are temporarily unavailable. "
+                        "Please try again shortly."
+                    )
+                }
+
+            except Exception as exc:
+                logger.exception(
+                    "Gateway tool loading failed: %s", exc
+                )
+                return {
+                    "error": (
+                        "Customer support tools could not be loaded. "
+                        "Please try again shortly."
+                    )
+                }
 
             agent = Agent(
                 model=model,
-                tools=[
-                    *gateway_tools,
-                    search_knowledge_base,
-                    calculate_loyalty_discount,
-                    browser_tool.browser,
-                ],
+                tools=agent_tools,
                 hooks=[memory_hook],
                 system_prompt=system_prompt,
             )
@@ -378,9 +492,14 @@ Use a name such as "browser-session". Never use underscores, spaces, or capital 
                 "session_id": session_id,
             }
 
-    except Exception as error:
+    except Exception:
         logger.exception("Agent invocation failed")
-        return {"error": f"Agent invocation failed: {str(error)}"}
+        return {
+            "error": (
+                "I could not complete that request right now. "
+                "Please try again shortly."
+            )
+        }
 
 
 if __name__ == "__main__":
