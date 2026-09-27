@@ -223,7 +223,17 @@ class MemoryHook(HookProvider):
 # — Knowledge Base Tool ─────────────────────────────────────────────
 @tool
 def search_knowledge_base(query: str) -> str:
-    """Search customer support policies, product details, and loyalty information."""
+    """
+    Search the customer support knowledge base for static policy and product information.
+
+    Use this tool when the customer asks about:
+    - Product specifications, features, or compatibility
+    - Return and refund policies, such as return windows and eligible categories
+    - Loyalty program tiers, benefits, and earning rules
+    - Shipping policies or warranty information
+
+    Do NOT use this tool for live order status, refund processing, or discount calculations.
+    """
     if not KB_ID or not KB_ID.strip():
         return (
             "Knowledge Base is not configured: KB_ID is empty or missing. "
